@@ -1,0 +1,1 @@
+# medidor-energia-2026
