@@ -23,10 +23,12 @@ Las telemetrias se envian a una base de datos por medio de wifi -> MQTT -> Base 
 - Un proyecto en supabase para almacenar telemetrias.
 - Accesos por HTTP POST para conectar el EMQX.
 
+## Github :
+- Código fuente del ESP32 y de la APP web.
+
 ## Página web :
 - Server https://vercel.com/
 - Una pagina web para mostrar datos de la base de datos.
 - En principio creada en Next.Js
 
-## Github :
-- Código fuente del ESP32 y de la APP web.
+- *Test local*: npm run dev
