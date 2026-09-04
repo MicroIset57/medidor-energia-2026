@@ -38,9 +38,9 @@ Importante: la salida del ACS712 puede llegar hasta casi 5 V, pero el ADC del ES
 
 Usa un divisor resistivo, por ejemplo:
 
-ACS712 OUT --- 10 kΩ ---+--- GPIO ADC del ESP32
+ACS712 OUT ---[ 10 kΩ ]---+--- GPIO ADC del ESP32
                         |
-                       20 kΩ
+                      [20 kΩ]                       
                         |
                        GND
 
