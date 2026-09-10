@@ -74,3 +74,169 @@ energia_kwh += potencia_w * intervalo_horas / 1000.0;
 
 ---
 
+# Cálculo de kWh desde los datos guardados en la base
+
+El problema con enviar un acumulado local en el ESP32 es que al reiniciarse el dispositivo, la variable `kwh` vuelve a cero y el histórico queda roto.
+
+La solución correcta es guardar solo la energía del intervalo y reconstruir el total en base de datos.
+
+## 1. Guardar el consumo por intervalo
+
+En cada lectura enviar:
+
+- `ts` = timestamp de la medición
+- `corriente`
+- `tension`
+- `potencia`
+- `intervalo_segundos`
+
+Por ejemplo:
+
+```json
+{
+  "device": "zapa01",
+  "ts": "2026-09-10T15:00:00-03:00",
+  "tipo": "medicion",
+  "data": {
+    "corriente": 1.25,
+    "tension": 220,
+    "potencia": 275,
+    "intervalo_segundos": 5
+  }
+}
+```
+
+## 2. Calcular el kWh de cada medición
+
+Para cada registro, el consumo del intervalo es:
+
+```text
+kwh_intervalo = potencia_w * intervalo_horas / 1000
+```
+
+donde:
+
+```text
+intervalo_horas = intervalo_segundos / 3600
+```
+
+Ejemplo:
+
+```text
+potencia = 275 W
+intervalo = 5 s
+intervalo_horas = 5 / 3600 = 0.0013889
+kwh_intervalo = 275 * 0.0013889 / 1000 = 0.0003819 kWh
+```
+
+El JSON que debe enviarse a Supabase desde el ESP32 es:
+
+```json
+{
+  "device": "zapa01",
+  "ts": "2026-09-10T15:00:00-03:00",
+  "tipo": "medicion",
+  "data": {
+    "corriente": 1.25,
+    "tension": 220,
+    "potencia": 275,
+    "intervalo_segundos": 5,
+    "kwh_intervalo": 0.0003819
+  }
+}
+```
+
+## 3. Acumular en la base de datos
+
+Con tu tabla `public.telemetria`, la consulta para leer cada lectura y su acumulado es:
+
+```sql
+SELECT
+  id,
+  device,
+  ts,
+  tipo,
+  data,
+  (data->>'corriente')::numeric AS corriente,
+  (data->>'tension')::numeric AS tension,
+  (data->>'potencia')::numeric AS potencia_w,
+  (data->>'intervalo_segundos')::numeric AS intervalo_segundos,
+  (data->>'kwh_intervalo')::numeric AS kwh_intervalo,
+  SUM((data->>'kwh_intervalo')::numeric) OVER (
+    PARTITION BY device
+    ORDER BY ts
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS kwh_acumulado_total
+FROM public.telemetria
+ORDER BY device, ts;
+```
+
+Y si solo querés el total de todo el historial por dispositivo:
+
+```sql
+SELECT
+  device,
+  SUM((data->>'kwh_intervalo')::numeric) AS kwh_total
+FROM public.telemetria
+GROUP BY device
+ORDER BY device;
+```
+
+Para ver el consumo por día:
+
+```sql
+SELECT
+  device,
+  date(ts AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires') AS fecha,
+  SUM((data->>'kwh_intervalo')::numeric) AS kwh_dia
+FROM public.telemetria
+GROUP BY device, date(ts AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')
+ORDER BY device, fecha;
+```
+
+Para ver el consumo por mes:
+
+```sql
+SELECT
+  device,
+  date_trunc('month', ts AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires') AS mes,
+  SUM((data->>'kwh_intervalo')::numeric) AS kwh_mes
+FROM public.telemetria
+GROUP BY device, date_trunc('month', ts AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')
+ORDER BY device, mes;
+```
+
+## 4. Mejor práctica para no perder continuidad
+
+No enviar un `kwh` acumulado que viva solo en memoria del ESP32.
+
+En cambio:
+
+- guardar `potencia` o `energia_del_intervalo`
+- calcular el total en la base
+- si el ESP32 se resetea, la nueva serie continúa desde cero, pero la base suma sobre los valores históricos
+
+## 5. Regla práctica
+
+El ESP32 debería enviar mediciones de potencia instantánea o energía del intervalo, no un contador total local.
+
+La base es la responsable de responder:
+
+```text
+kwh_total_hasta_ahora = suma de todos los intervalos desde el inicio
+```
+
+Esto evita que al resetear el ESP32 el contador vuelva a 0.
+
+---
+
+energia de hoy:
+
+SELECT
+  device,
+  SUM((data->>'kwh_intervalo')::numeric) AS kwh_total
+FROM public.telemetria
+WHERE ts BETWEEN '2026-09-10T00:00:00-03:00'::timestamptz
+             AND '2026-09-10T23:59:59-03:00'::timestamptz
+GROUP BY device
+ORDER BY device;
