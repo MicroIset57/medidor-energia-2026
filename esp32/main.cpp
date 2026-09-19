@@ -4,252 +4,749 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <TFT_eSPI.h>
 
-const char *wifiSsid = "micromicro";
-const char *wifiPassword = "micromicro";
+// ------------------------------------------------------------------ configuracion
 const char *mqttHost = "k1127d70.ala.us-east-1.emqxsl.com";
 const int mqttPort = 8883;
 const char *mqttUser = "device";
 const char *mqttPassword = "device";
-const char *mqttTopic = "telemetria/zapa01";
-const char *device_name = "zapa01";
+const char *mqttTopicBase = "telemetria/";
+const char *nombreFabrica = "zapa01";
 
-const unsigned long wifiTimeoutMs = 20000;
+// Red de fabrica: se guarda sola en el primer arranque si la flash esta vacia,
+// asi el equipo sigue funcionando sin pasar por el portal.
+const char *wifiSsidFabrica = "micromicro";
+const char *wifiPasswordFabrica = "micromicro";
+
+const unsigned long wifiTimeoutMs = 12000;   // por red; se prueban varias seguidas
 const unsigned long mqttRetryMs = 5000;
+const unsigned long messageInterval = 5000;
+const unsigned long reintentoWifiMs = 30000; // cada cuanto reintentar desde el portal
+const unsigned long graciaPortalMs = 45000;  // pausa de reintentos tras usar el portal
 
-const int ACS712_PIN = 34;               // ADC1_CH6 del ESP32
+// GPIO34 esta ocupado en la T-Display: va al divisor que mide la bateria.
+const int ACS712_PIN = 32;               // ADC1_CH4, libre en el header
 const float ACS712_SENSITIVITY = 0.185f; // 5A -> 185 mV/A
-const float ACS712_OFFSET_VOLT = 1.65f;  // VCC/2 con 3.3V
-const float TENSION_RED = 220.0f;        // tensión asumida para cálculo de potencia
+const float TENSION_RED = 220.0f;        // nominal, se usa solo si no hay transformador
 
-// valores globales de medicion del ACS712:
-float corriente = 0;     // Valor de corriente RMS en amperios
-float tension = 0;       // Valor de tensión en voltios
-float potencia = 0;      // Valor de potencia en vatios
-float kwh = 0;           // Valor acumulado local de energía en kWh (solo para referencia)
-float kwh_intervalo = 0; // Energía del intervalo actual en kWh
-float adcOffsetVoltage = ACS712_OFFSET_VOLT;
+// Entrada de tension: transformador + divisor, acoplado por capacitor y polarizado
+// a ~1.65V con dos resistencias iguales (el ADC no lee negativo).
+// TENSION_ESCALA = volts de red por cada volt que llega al pin. Con 100 a 1 son 100.
+const int TENSION_PIN = 33;              // ADC1_CH5, libre en el header
+const float TENSION_ESCALA = 100.0f;
+const float TENSION_MINIMA = 20.0f;      // debajo de esto se asume que no hay transformador
 
-unsigned long lastEnergyMillis = 0;
+const uint32_t VENTANA_MUESTREO_MS = 200;
+const float CORRIENTE_MINIMA = 0.05f; // piso de ruido del sensor, debajo de esto es cero
 
+const uint8_t MAX_REDES = 5;
+
+// ------------------------------------------------------------------ estado
+float corriente = 0;        // Valor de corriente RMS en amperios
+float tension = 0;          // Valor de tension en voltios
+float potencia = 0;         // Valor de potencia en vatios
+float kwh = 0;              // Acumulado total local, solo para mostrar
+float adcOffsetVoltage = 0; // offset medido en la ultima lectura (diagnostico)
+bool tensionMedida = false; // false = se esta usando el nominal, no una medicion real
+
+// Energia acumulada desde el ultimo envio exitoso. Sin WiFi se sigue sumando y al
+// reconectar sale todo junto en un solo mensaje, con su intervalo real en segundos.
+float kwhPendiente = 0;
+float segundosPendientes = 0;
+
+unsigned long ultimaMedicionMs = 0;
+unsigned long lastMessage = 0;
+unsigned long ultimoIntentoMqtt = 0;
+unsigned long ultimoIntentoWifi = 0;
+
+String redSsid[MAX_REDES];
+String redPass[MAX_REDES];
+uint8_t cantidadRedes = 0;
+
+bool portalActivo = false;
+unsigned long ultimoClienteMs = 0; // ultima vez que hubo alguien asociado al AP
+String apSsid;
+String redesEscaneadas;       // <option> cacheados del ultimo escaneo
+
+String deviceName; // editable desde el portal, persiste en flash
+String mqttTopic;  // telemetria/<deviceName>, se rearma al renombrar
+
+Preferences prefs;
+WebServer server(80);
 WiFiClientSecure secureClient;
 PubSubClient mqttClient(secureClient);
-unsigned long lastMessage = 0;
-const unsigned long messageInterval = 5000;
+TFT_eSPI tft = TFT_eSPI();
 
-void synchronizeClock()
+// ------------------------------------------------------------------ redes en flash
+void GuardarRedes()
+{
+    prefs.begin("wifi", false);
+    prefs.putUChar("n", cantidadRedes);
+    for (uint8_t i = 0; i < cantidadRedes; i++)
+    {
+        prefs.putString(("s" + String(i)).c_str(), redSsid[i]);
+        prefs.putString(("p" + String(i)).c_str(), redPass[i]);
+    }
+    prefs.end();
+}
+
+void CargarRedes()
+{
+    prefs.begin("wifi", true);
+    cantidadRedes = prefs.getUChar("n", 0);
+    if (cantidadRedes > MAX_REDES)
+    {
+        cantidadRedes = MAX_REDES;
+    }
+    for (uint8_t i = 0; i < cantidadRedes; i++)
+    {
+        redSsid[i] = prefs.getString(("s" + String(i)).c_str(), "");
+        redPass[i] = prefs.getString(("p" + String(i)).c_str(), "");
+    }
+    prefs.end();
+
+    if (cantidadRedes == 0 && strlen(wifiSsidFabrica) > 0)
+    {
+        redSsid[0] = wifiSsidFabrica;
+        redPass[0] = wifiPasswordFabrica;
+        cantidadRedes = 1;
+        GuardarRedes();
+    }
+}
+
+// Si el SSID ya estaba guardado se actualiza la clave en lugar de duplicarlo.
+void AgregarRed(const String &ssid, const String &pass)
+{
+    for (uint8_t i = 0; i < cantidadRedes; i++)
+    {
+        if (redSsid[i] == ssid)
+        {
+            redPass[i] = pass;
+            GuardarRedes();
+            return;
+        }
+    }
+
+    if (cantidadRedes == MAX_REDES)
+    {
+        // Lista llena: se descarta la mas vieja para hacer lugar.
+        for (uint8_t i = 0; i < MAX_REDES - 1; i++)
+        {
+            redSsid[i] = redSsid[i + 1];
+            redPass[i] = redPass[i + 1];
+        }
+        cantidadRedes--;
+    }
+
+    redSsid[cantidadRedes] = ssid;
+    redPass[cantidadRedes] = pass;
+    cantidadRedes++;
+    GuardarRedes();
+}
+
+void BorrarRed(uint8_t indice)
+{
+    if (indice >= cantidadRedes)
+    {
+        return;
+    }
+    for (uint8_t i = indice; i < cantidadRedes - 1; i++)
+    {
+        redSsid[i] = redSsid[i + 1];
+        redPass[i] = redPass[i + 1];
+    }
+    cantidadRedes--;
+    GuardarRedes();
+}
+
+// ------------------------------------------------------------------ display
+// El encabezado se repinta aparte porque el nombre puede cambiar desde el portal.
+void DibujarEncabezado()
+{
+    tft.fillRect(0, 0, 145, 21, TFT_BLACK); // hasta 145: a la derecha van WiFi/MQTT
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(deviceName, 5, 3, 2);
+}
+
+void IniciarDisplay()
+{
+    tft.init();
+    tft.setRotation(1); // 240x135, apaisado
+    tft.fillScreen(TFT_BLACK);
+    DibujarEncabezado();
+}
+
+void MostrarPortal()
+{
+    tft.fillRect(0, 22, 240, 113, TFT_BLACK);
+
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.drawString("SIN WIFI", 8, 26, 2);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Conectese a la red :", 8, 44, 2);
+
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(apSsid, 8, 62, 4);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("y abra 192.168.4.1", 8, 92, 2);
+
+    // Se aclara que la energia no se pierde mientras no hay red.
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("pend: " + String(kwhPendiente, 3) + " kWh", 8, 112, 2);
+}
+
+void ActualizarDisplay()
+{
+    if (portalActivo)
+    {
+        MostrarPortal();
+        return;
+    }
+
+    // El encabezado queda fijo, se repinta solo el area de datos.
+    tft.fillRect(0, 22, 240, 113, TFT_BLACK);
+
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.drawString(String(corriente, 2) + " A", 8, 30, 4);
+    tft.setTextSize(1);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(potencia, 0) + " W", 8, 88, 4);
+
+    // La tension puede venir del transformador o ser el nominal asumido: se aclara
+    // debajo del valor para no confundir un dato medido con uno supuesto.
+    tft.setTextColor(tensionMedida ? TFT_WHITE : TFT_DARKGREY, TFT_BLACK);
+    tft.drawString(String(tension, 0) + " V", 140, 88, 4);
+    tft.setTextColor(tensionMedida ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+    tft.drawString(tensionMedida ? "online" : "fijo", 140, 116, 2);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(kwh, 3) + " kWh", 8, 116, 2);
+
+    // Estado de conexion, arriba a la derecha junto al nombre del equipo.
+    bool wifiOk = WiFi.status() == WL_CONNECTED;
+    tft.setTextColor(wifiOk ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    tft.drawString(wifiOk ? "WiFi" : "----", 150, 3, 2);
+
+    bool mqttOk = mqttClient.connected();
+    tft.setTextColor(mqttOk ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    tft.drawString(mqttOk ? "MQTT" : "----", 195, 3, 2);
+}
+
+// ------------------------------------------------------------------ nombre
+// El nombre va dentro del topic MQTT, asi que no puede llevar los caracteres que
+// MQTT reserva (/ + #) ni espacios: se reemplazan por guion.
+String LimpiarNombre(const String &crudo)
+{
+    String limpio;
+    for (uint16_t i = 0; i < crudo.length() && limpio.length() < 20; i++)
+    {
+        char c = crudo[i];
+        bool valido = isalnum(c) || c == '-' || c == '_';
+        limpio += valido ? c : '-';
+    }
+    limpio.trim();
+    return limpio.length() > 0 ? limpio : String(nombreFabrica);
+}
+
+void AplicarNombre(const String &nombre)
+{
+    deviceName = nombre;
+    mqttTopic = String(mqttTopicBase) + deviceName;
+}
+
+void CargarNombre()
+{
+    prefs.begin("cfg", true);
+    String guardado = prefs.getString("nombre", nombreFabrica);
+    prefs.end();
+    AplicarNombre(LimpiarNombre(guardado));
+}
+
+void GuardarNombre(const String &crudo)
+{
+    AplicarNombre(LimpiarNombre(crudo));
+
+    prefs.begin("cfg", false);
+    prefs.putString("nombre", deviceName);
+    prefs.end();
+
+    DibujarEncabezado();
+    Serial.printf("Nombre: %s  topic: %s\n", deviceName.c_str(), mqttTopic.c_str());
+}
+
+// ------------------------------------------------------------------ hora
+void SincronizarHora()
 {
     configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
 
     struct tm localTime;
-    Serial.print("Sincronizando hora de Argentina");
-    for (int attempt = 0; attempt < 20 && !getLocalTime(&localTime, 500); attempt++)
+    Serial.print("Sincronizando hora");
+    for (int intento = 0; intento < 20 && !getLocalTime(&localTime, 500); intento++)
     {
         Serial.print(".");
     }
     Serial.println();
-
-    if (getLocalTime(&localTime, 100))
-    {
-        char formattedTime[24];
-        strftime(formattedTime, sizeof(formattedTime), "%Y-%m-%d %H:%M:%S", &localTime);
-        Serial.printf("Hora de Argentina: %s\n", formattedTime);
-    }
-    else
-    {
-        Serial.println("No se pudo sincronizar la hora.");
-    }
 }
 
-String getInternetTimestamp()
+String ObtenerTimestamp()
 {
-    time_t currentTime = time(nullptr);
-    if (currentTime < 1000000000)
+    time_t ahora = time(nullptr);
+    if (ahora < 1000000000)
     {
         return "";
     }
 
-    // todo en horal local ARGENTINA!
+    // todo en hora local ARGENTINA!
     struct tm localTime;
-    localtime_r(&currentTime, &localTime);
+    localtime_r(&ahora, &localTime);
 
-    char formattedTime[30];
-    strftime(formattedTime, sizeof(formattedTime), "%Y-%m-%dT%H:%M:%S-03:00", &localTime);
-    return String(formattedTime);
+    char texto[30];
+    strftime(texto, sizeof(texto), "%Y-%m-%dT%H:%M:%S-03:00", &localTime);
+    return String(texto);
 }
 
-bool connectToWiFi()
+// ------------------------------------------------------------------ portal AP
+// El ESP32 tiene una sola radio: escanear la obliga a saltar de canal unos segundos
+// y desasocia a los clientes del AP. Por eso se escanea aparte y se cachea el
+// resultado, en vez de hacerlo en cada carga de la pagina.
+void EscanearRedes()
 {
-    Serial.printf("Conectando a %s (timeout %lu ms)\n", wifiSsid, wifiTimeoutMs);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.disconnect(true);
-    delay(250);
-    WiFi.begin(wifiSsid, wifiPassword);
-    WiFi.setAutoReconnect(true);
-
-    unsigned long startTime = millis();
-    int lastStatus = WiFi.status();
-    Serial.print("Esperando conectarse");
-
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < wifiTimeoutMs)
+    redesEscaneadas = "";
+    int encontradas = WiFi.scanNetworks();
+    for (int i = 0; i < encontradas; i++)
     {
-        delay(500);
-        int currentStatus = WiFi.status();
-        if (currentStatus != lastStatus)
-        {
-            Serial.printf("\nWiFi status: %d", currentStatus);
-            lastStatus = currentStatus;
-        }
-        Serial.print(".");
+        redesEscaneadas += "<option>" + WiFi.SSID(i) + "</option>";
+    }
+    WiFi.scanDelete();
+
+    if (encontradas <= 0)
+    {
+        redesEscaneadas = F("<option>(no se encontraron redes)</option>");
+    }
+}
+
+String PaginaPrincipal()
+{
+    String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                 "<style>body{font-family:sans-serif;margin:16px;max-width:420px}"
+                 "select,input{width:100%;padding:8px;margin:4px 0;box-sizing:border-box}"
+                 "button{padding:10px 16px;width:100%}li{margin:6px 0}"
+                 "a{color:#c00;text-decoration:none}</style><h2>Medidor ");
+    h += deviceName;
+
+    h += F("</h2><h3>Nombre del dispositivo</h3>"
+           "<form method=POST action=/nombre>"
+           "<input name=nombre maxlength=20 value='");
+    h += deviceName;
+    h += F("'><button>Renombrar</button></form>"
+           "<p style='font-size:.85em;color:#666'>Se publica en <code>");
+    h += mqttTopic;
+    h += F("</code></p>");
+
+    h += F("<h3>Redes guardadas</h3><ul>");
+    if (cantidadRedes == 0)
+    {
+        h += F("<li>ninguna</li>");
+    }
+    for (uint8_t i = 0; i < cantidadRedes; i++)
+    {
+        h += "<li>" + redSsid[i] + " <a href='/borrar?i=" + String(i) + "'>[borrar]</a></li>";
     }
 
-    Serial.println();
+    h += F("</ul><h3>Agregar red</h3><form method=POST action=/guardar><select name=ssid>");
+    h += redesEscaneadas; // cacheado: escanear aca voltearia al cliente del AP
+
+    h += F("</select><input name=pass placeholder=Contrasena>"
+           "<button>Guardar y conectar</button></form>"
+           "<p><a href='/rescan' style='color:#06c'>Volver a escanear</a>"
+           " <span style='font-size:.85em;color:#666'>(se corta un momento)</span></p>");
+    return h;
+}
+
+bool IntentarConectar(const String &ssid, const String &pass)
+{
+    Serial.printf("Probando %s...\n", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    unsigned long inicio = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - inicio < wifiTimeoutMs)
+    {
+        delay(250);
+    }
+
     if (WiFi.status() == WL_CONNECTED)
     {
+        // Se vuelve a habilitar: el portal lo apaga para no arrastrar la radio de canal.
+        WiFi.setAutoReconnect(true);
         Serial.print("Conectado. IP: ");
         Serial.println(WiFi.localIP());
         return true;
     }
-
-    Serial.printf("No se pudo conectar a la red. Estado WiFi final: %d\n", WiFi.status());
     return false;
 }
 
-void connectToMqtt()
+// Escanea y prueba solo las redes guardadas que esten efectivamente al alcance.
+bool ConectarAGuardadas()
 {
-    while (!mqttClient.connected())
+    if (cantidadRedes == 0)
     {
-        String clientId = "esp01-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF), HEX);
-        Serial.printf("Conectando a MQTT (%s)... ", mqttHost);
-        if (mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword))
-        {
-            Serial.println("conectado");
-            return;
-        }
+        return false;
+    }
 
-        Serial.printf("fallo (estado %d). Reintentando en %lu ms...\n", mqttClient.state(), mqttRetryMs);
-        delay(mqttRetryMs);
+    int encontradas = WiFi.scanNetworks();
+    for (int i = 0; i < encontradas; i++)
+    {
+        String ssid = WiFi.SSID(i);
+        for (uint8_t j = 0; j < cantidadRedes; j++)
+        {
+            if (redSsid[j] == ssid && IntentarConectar(redSsid[j], redPass[j]))
+            {
+                WiFi.scanDelete();
+                return true;
+            }
+        }
+    }
+    WiFi.scanDelete();
+    return false;
+}
+
+void DetenerPortal()
+{
+    if (!portalActivo)
+    {
+        return;
+    }
+    server.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    portalActivo = false;
+}
+
+void ManejarRaiz()
+{
+    server.send(200, "text/html", PaginaPrincipal());
+}
+
+void ManejarGuardar()
+{
+    String ssid = server.arg("ssid");
+    if (ssid.length() > 0)
+    {
+        AgregarRed(ssid, server.arg("pass"));
+    }
+    server.send(200, "text/html",
+                F("<meta http-equiv=refresh content='5;url=/'>"
+                  "<p style='font-family:sans-serif'>Guardada. Probando la conexion...</p>"));
+
+    // Se prueba recien despues de responder, asi el celular alcanza a ver la pagina.
+    delay(500);
+    if (IntentarConectar(ssid, server.arg("pass")))
+    {
+        DetenerPortal();
+        SincronizarHora();
     }
 }
 
-void publishMessage(float corriente, float tension, float potencia, float kwhIntervalo)
+void ManejarRescan()
 {
-    String internetTimestamp = getInternetTimestamp();
-    if (internetTimestamp.isEmpty())
+    EscanearRedes();
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "");
+}
+
+void ManejarNombre()
+{
+    GuardarNombre(server.arg("nombre"));
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "");
+}
+
+void ManejarBorrar()
+{
+    BorrarRed(server.arg("i").toInt());
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "");
+}
+
+void IniciarPortal()
+{
+    if (portalActivo)
     {
-        Serial.println("No se envia: la hora NTP aun no esta sincronizada.");
         return;
     }
 
-    float intervaloSegundos = messageInterval / 1000.0f;
-    String message = "{\"device\":\"" + String(device_name) +
-                     "\",\"ts\":\"" + internetTimestamp + "\"" +
+    apSsid = "medidor-" + deviceName;
+
+    // El escaneo va ANTES de levantar el AP, con la radio libre. Y hay que cortar
+    // la parte STA: si sigue reintentando una red guardada en segundo plano, arrastra
+    // la radio a otro canal y el celular no logra asociarse.
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(true);
+    delay(100);
+    EscanearRedes();
+
+    WiFi.mode(WIFI_AP_STA); // AP_STA: el STA hace falta para reintentar y para /rescan
+    WiFi.softAP(apSsid.c_str(), nullptr, 1); // canal 1 fijo, abierta (sin clave)
+
+    server.on("/", ManejarRaiz);
+    server.on("/guardar", HTTP_POST, ManejarGuardar);
+    server.on("/nombre", HTTP_POST, ManejarNombre);
+    server.on("/rescan", ManejarRescan);
+    server.on("/borrar", ManejarBorrar);
+    server.begin();
+
+    portalActivo = true;
+    ultimoClienteMs = 0;
+    ultimoIntentoWifi = millis();
+    Serial.printf("Portal abierto. Red: %s  ->  http://192.168.4.1\n", apSsid.c_str());
+    ActualizarDisplay();
+}
+
+// ------------------------------------------------------------------ medicion
+// Resultado de muestrear un pin durante una ventana completa.
+struct MedicionRms
+{
+    float offsetVolt; // componente continua: el punto de reposo real de la entrada
+    float rmsVolt;    // valor eficaz de la componente alterna
+    uint32_t muestras;
+};
+
+// Muestrea lo mas rapido posible durante la ventana entera. No asume ningun offset:
+// la media de las muestras ES el punto de reposo, porque la senal alterna es
+// simetrica alrededor de el. Asi las dos entradas se calibran solas en cada lectura,
+// al encender y siguiendo la deriva termica y de alimentacion.
+MedicionRms MedirRms(int pin)
+{
+    uint32_t muestras = 0;
+    double suma = 0.0;
+    double sumaCuadrados = 0.0;
+
+    unsigned long inicio = millis();
+    while (millis() - inicio < VENTANA_MUESTREO_MS)
+    {
+        // analogReadMilliVolts usa la calibracion de fabrica del chip y corrige la
+        // no linealidad del ADC, a diferencia de (adc / 4095) * 3.3
+        double milliVolt = analogReadMilliVolts(pin);
+        suma += milliVolt;
+        sumaCuadrados += milliVolt * milliVolt;
+        muestras++;
+    }
+
+    MedicionRms resultado = {0.0f, 0.0f, muestras};
+    if (muestras == 0)
+    {
+        return resultado;
+    }
+
+    double media = suma / muestras;
+    double varianza = sumaCuadrados / muestras - media * media;
+    if (varianza < 0.0)
+    {
+        varianza = 0.0;
+    }
+
+    resultado.offsetVolt = media / 1000.0f;
+    resultado.rmsVolt = sqrt(varianza) / 1000.0f;
+    return resultado;
+}
+
+void MedirValores()
+{
+    MedicionRms sensor = MedirRms(ACS712_PIN);
+    if (sensor.muestras == 0)
+    {
+        return;
+    }
+
+    adcOffsetVoltage = sensor.offsetVolt;
+    corriente = sensor.rmsVolt / ACS712_SENSITIVITY;
+    if (corriente < CORRIENTE_MINIMA)
+    {
+        corriente = 0.0f;
+    }
+
+    // Tension: misma tecnica, escalada por el transformador + divisor.
+    MedicionRms red = MedirRms(TENSION_PIN);
+    float tensionLeida = red.rmsVolt * TENSION_ESCALA;
+    tensionMedida = tensionLeida >= TENSION_MINIMA;
+
+    // Mientras no haya transformador conectado se sigue usando el nominal, asi el
+    // equipo mide igual y pasa a la tension real sola cuando la entrada este cableada.
+    tension = tensionMedida ? tensionLeida : TENSION_RED;
+    potencia = tension * corriente;
+
+    Serial.printf("%.3f A  %.1f V%s  %.0f W\n", corriente, tension,
+                  tensionMedida ? "" : "(fijo)", potencia);
+
+    // La energia se integra con el tiempo real transcurrido, no con el nominal de
+    // 5 s: si el envio se atrasa o el portal bloquea el loop, el kWh sigue siendo
+    // correcto.
+    unsigned long ahora = millis();
+    if (ultimaMedicionMs != 0)
+    {
+        float deltaSegundos = (ahora - ultimaMedicionMs) / 1000.0f;
+        float deltaKwh = (potencia * deltaSegundos) / 3600000.0f;
+        kwh += deltaKwh;
+        kwhPendiente += deltaKwh;
+        segundosPendientes += deltaSegundos;
+    }
+    ultimaMedicionMs = ahora;
+}
+
+// ------------------------------------------------------------------ mqtt
+bool PublicarMedicion()
+{
+    String timestamp = ObtenerTimestamp();
+    if (timestamp.isEmpty())
+    {
+        Serial.println("No se envia: la hora NTP aun no esta sincronizada.");
+        return false;
+    }
+
+    String mensaje = "{\"device\":\"" + deviceName +
+                     "\",\"ts\":\"" + timestamp + "\"" +
                      ",\"tipo\":\"medicion\",\"data\":{\"corriente\":" +
                      String(corriente) + ",\"tension\":" + String(tension) +
+                     ",\"tension_medida\":" + (tensionMedida ? "true" : "false") +
                      ",\"potencia\":" + String(potencia) +
-                     ",\"intervalo_segundos\":" + String(intervaloSegundos) +
-                     ",\"kwh_intervalo\":" + String(kwhIntervalo) + "}}";
-    if (mqttClient.publish(mqttTopic, message.c_str()))
-    {
-        Serial.printf("Mensaje enviado a %s: %s\n", mqttTopic, message.c_str());
-    }
-    else
+                     ",\"intervalo_segundos\":" + String(segundosPendientes, 1) +
+                     ",\"kwh_intervalo\":" + String(kwhPendiente, 6) + "}}";
+
+    if (!mqttClient.publish(mqttTopic.c_str(), mensaje.c_str()))
     {
         Serial.println("No se pudo enviar el mensaje MQTT.");
+        return false;
+    }
+
+    Serial.printf("Enviado: %s\n", mensaje.c_str());
+    return true;
+}
+
+void AtenderMqtt()
+{
+    if (mqttClient.connected())
+    {
+        mqttClient.loop();
+        return;
+    }
+
+    if (millis() - ultimoIntentoMqtt < mqttRetryMs)
+    {
+        return;
+    }
+    ultimoIntentoMqtt = millis();
+
+    String clientId = "esp32-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF), HEX);
+    if (!mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword))
+    {
+        Serial.printf("MQTT fallo (estado %d)\n", mqttClient.state());
     }
 }
 
+// ------------------------------------------------------------------ setup / loop
 void setup()
 {
     Serial.begin(115200);
-    delay(2000);
+    delay(3000);
     Serial.printf("Motivo del reset: %d\n", esp_reset_reason());
-    Serial.println("\nCliente MQTT ESP32");
 
-    pinMode(ACS712_PIN, INPUT);
+    CargarNombre(); // antes del display: el encabezado muestra el nombre
+    IniciarDisplay();
+
+    // El canal ADC del pin se adjunta en la primera lectura: hacemos una lectura
+    // dummy antes de fijar la atenuacion, si no analogSetPinAttenuation() falla con
+    // "Pin is not configured as analog channel".
     analogReadResolution(12);
+    analogRead(ACS712_PIN);
     analogSetPinAttenuation(ACS712_PIN, ADC_11db);
+    analogRead(TENSION_PIN);
+    analogSetPinAttenuation(TENSION_PIN, ADC_11db);
 
-    if (!connectToWiFi())
+    CargarRedes();
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+
+    if (ConectarAGuardadas())
     {
-        Serial.println("WiFi no disponible. Revisar SSID y password en main.cpp.");
-        Serial.println("El ESP32 seguira intentando reconexion en el loop.");
+        SincronizarHora();
     }
     else
     {
-        synchronizeClock();
+        IniciarPortal();
     }
 
     secureClient.setInsecure();
     mqttClient.setServer(mqttHost, mqttPort);
     mqttClient.setKeepAlive(60);
     mqttClient.setSocketTimeout(10);
-    Serial.println("\nInit listo.");
-}
-
-void MedirValoresACS712()
-{
-    const uint16_t sampleCount = 120;
-    const uint16_t sampleDelayMs = 2;
-    float rmsAccumulator = 0.0f;
-
-    for (uint16_t i = 0; i < sampleCount; i++)
-    {
-        uint32_t adcValue = analogRead(ACS712_PIN);
-        float sensorVoltage = (adcValue / 4095.0f) * 3.3f;
-        float deltaVoltage = sensorVoltage - adcOffsetVoltage;
-        rmsAccumulator += deltaVoltage * deltaVoltage;
-        delay(sampleDelayMs);
-    }
-
-    float rmsVoltage = sqrtf(rmsAccumulator / sampleCount);
-    corriente = fabsf(rmsVoltage / ACS712_SENSITIVITY);
-
-    if (corriente < 0.05f)
-    {
-        corriente = 0.0f;
-    }
-
-    tension = TENSION_RED;
-    potencia = tension * corriente;
-
-    float intervaloSegundos = messageInterval / 1000.0f;
-    kwh_intervalo = (potencia * intervaloSegundos) / 1000.0f;
-
-    unsigned long now = millis();
-    if (lastEnergyMillis == 0)
-    {
-        lastEnergyMillis = now;
-    }
-
-    float elapsedHours = (now - lastEnergyMillis) / 3600000.0f;
-    kwh += (potencia * elapsedHours) / 1000.0f;
-    lastEnergyMillis = now;
+    Serial.println("Init listo.");
 }
 
 void loop()
 {
-    if (WiFi.status() != WL_CONNECTED)
+    if (portalActivo)
     {
-        if (!connectToWiFi())
+        server.handleClient();
+
+        // Los reintentos se suspenden mientras haya alguien asociado al AP (un scan o
+        // un WiFi.begin() en medio de la configuracion mueve la radio de canal y
+        // voltea al celular), y por un rato despues de que se va, por si fue un corte
+        // momentaneo. Pasada esa gracia se vuelven a habilitar solos.
+        if (WiFi.softAPgetStationNum() > 0)
         {
-            delay(2000);
-            return;
+            ultimoClienteMs = millis();
+        }
+        bool portalEnUso = ultimoClienteMs != 0 && millis() - ultimoClienteMs < graciaPortalMs;
+
+        // Si nadie esta usando el portal se reintentan las redes guardadas: cubre el
+        // caso de que el router vuelva solo despues de un corte.
+        if (!portalEnUso && millis() - ultimoIntentoWifi >= reintentoWifiMs)
+        {
+            ultimoIntentoWifi = millis();
+            if (ConectarAGuardadas())
+            {
+                DetenerPortal();
+                SincronizarHora();
+            }
+        }
+    }
+    else if (WiFi.status() != WL_CONNECTED)
+    {
+        if (!ConectarAGuardadas())
+        {
+            IniciarPortal();
+        }
+        else
+        {
+            SincronizarHora();
         }
     }
 
-    if (!mqttClient.connected())
+    if (WiFi.status() == WL_CONNECTED)
     {
-        connectToMqtt();
+        AtenderMqtt();
     }
-
-    mqttClient.loop();
 
     if (millis() - lastMessage >= messageInterval)
     {
-        MedirValoresACS712();
-        publishMessage(corriente, tension, potencia, kwh_intervalo);
         lastMessage = millis();
+        MedirValores();
+        ActualizarDisplay();
+
+        // Solo se limpia el acumulado si el envio salio bien: si falla, la energia
+        // se sigue sumando y viaja en el proximo mensaje.
+        if (mqttClient.connected() && PublicarMedicion())
+        {
+            kwhPendiente = 0;
+            segundosPendientes = 0;
+        }
     }
 }
