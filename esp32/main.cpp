@@ -28,16 +28,26 @@ const unsigned long reintentoWifiMs = 30000; // cada cuanto reintentar desde el 
 const unsigned long graciaPortalMs = 45000;  // pausa de reintentos tras usar el portal
 
 // GPIO34 esta ocupado en la T-Display: va al divisor que mide la bateria.
+// La salida del ACS712 (0-5V) pasa por un divisor 10k/20k antes del pin.
 const int ACS712_PIN = 32;               // ADC1_CH4, libre en el header
-const float ACS712_SENSITIVITY = 0.185f; // 5A -> 185 mV/A
-const float TENSION_RED = 220.0f;        // nominal, se usa solo si no hay transformador
+const float ACS712_DIVISOR = 20.0f / (10.0f + 20.0f);
+const float ACS712_SENSITIVITY = 0.185f * ACS712_DIVISOR; // 5A: 185 mV/A en el sensor
 
-// Entrada de tension: transformador + divisor, acoplado por capacitor y polarizado
-// a ~1.65V con dos resistencias iguales (el ADC no lee negativo).
-// TENSION_ESCALA = volts de red por cada volt que llega al pin. Con 100 a 1 son 100.
+// Entrada de tension (ver documentacion/circuito.jpeg): transformador 220/11.5V,
+// divisor 100k/6k8, capacitor de 1uF y polarizacion a 1.65V con 100k/100k.
+// El capacitor en serie con los 50k de polarizacion tambien atenua a 50 Hz.
+// Si la tension mostrada no coincide con un tester, ajustar TRAFO_SECUNDARIO.
 const int TENSION_PIN = 33;              // ADC1_CH5, libre en el header
-const float TENSION_ESCALA = 100.0f;
-const float TENSION_MINIMA = 20.0f;      // debajo de esto se asume que no hay transformador
+const float TRAFO_PRIMARIO = 220.0f;
+const float TRAFO_SECUNDARIO = 11.5f;
+const float DIV_SERIE = 100000.0f, DIV_INFERIOR = 6800.0f;
+const float POLARIZACION = 50000.0f;               // 100k || 100k
+const float REACTANCIA_C = 1.0f / (2.0f * PI * 50.0f * 1e-6f);
+const float DIV_THEVENIN = DIV_SERIE * DIV_INFERIOR / (DIV_SERIE + DIV_INFERIOR);
+const float TENSION_ESCALA =
+    (TRAFO_PRIMARIO / TRAFO_SECUNDARIO) *
+    ((DIV_SERIE + DIV_INFERIOR) / DIV_INFERIOR) *
+    (sqrtf(powf(DIV_THEVENIN + POLARIZACION, 2) + powf(REACTANCIA_C, 2)) / POLARIZACION);
 
 const uint32_t VENTANA_MUESTREO_MS = 200;
 const float CORRIENTE_MINIMA = 0.05f; // piso de ruido del sensor, debajo de esto es cero
@@ -50,7 +60,6 @@ float tension = 0;          // Valor de tension en voltios
 float potencia = 0;         // Valor de potencia en vatios
 float kwh = 0;              // Acumulado total local, solo para mostrar
 float adcOffsetVoltage = 0; // offset medido en la ultima lectura (diagnostico)
-bool tensionMedida = false; // false = se esta usando el nominal, no una medicion real
 
 // Energia acumulada desde el ultimo envio exitoso. Sin WiFi se sigue sumando y al
 // reconectar sale todo junto en un solo mensaje, con su intervalo real en segundos.
@@ -163,41 +172,82 @@ void BorrarRed(uint8_t indice)
 }
 
 // ------------------------------------------------------------------ display
-// El encabezado se repinta aparte porque el nombre puede cambiar desde el portal.
+const int Y_DATOS = 33; // arriba queda el encabezado: fecha/hora y nombre
+
+// Encabezado: fecha y hora, y debajo el nombre (que puede cambiar desde el portal).
 void DibujarEncabezado()
 {
-    tft.fillRect(0, 0, 145, 21, TFT_BLACK); // hasta 145: a la derecha van WiFi/MQTT
+    char fechaHora[20] = "--/--/-- --:--";
+    time_t ahora = time(nullptr);
+    if (ahora >= 1000000000) // hora NTP ya sincronizada
+    {
+        struct tm localTime;
+        localtime_r(&ahora, &localTime);
+        strftime(fechaHora, sizeof(fechaHora), "%d/%m/%y %H:%M", &localTime);
+    }
+
+    tft.fillRect(0, 0, 145, Y_DATOS, TFT_BLACK); // hasta 145: a la derecha van WiFi/MQTT
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(deviceName, 5, 3, 2);
+    tft.drawString(fechaHora, 5, 0, 2);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(deviceName, 5, 16, 2);
+}
+
+// Mensaje centrado en el area de datos mientras el equipo arranca o reconecta.
+// Con el portal abierto no se dibuja: taparia las instrucciones de conexion.
+void MostrarEstado(const String &linea1, const String &linea2 = "")
+{
+    if (portalActivo)
+    {
+        return;
+    }
+
+    tft.fillRect(0, Y_DATOS, 240, 135 - Y_DATOS, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+
+    int fuente = tft.textWidth(linea1, 4) <= 230 ? 4 : 2;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(linea1, 120, linea2.isEmpty() ? 84 : 74, fuente);
+
+    if (!linea2.isEmpty())
+    {
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString(linea2, 120, 102, 2);
+    }
+
+    tft.setTextDatum(TL_DATUM);
 }
 
 void IniciarDisplay()
 {
     tft.init();
-    tft.setRotation(1); // 240x135, apaisado
+    tft.setRotation(3); // 240x135, apaisado
     tft.fillScreen(TFT_BLACK);
     DibujarEncabezado();
+    MostrarEstado("Inicializando...");
 }
 
 void MostrarPortal()
 {
-    tft.fillRect(0, 22, 240, 113, TFT_BLACK);
+    DibujarEncabezado();
+    tft.fillRect(145, 0, 95, Y_DATOS, TFT_BLACK); // borra los indicadores WiFi/MQTT viejos
+    tft.fillRect(0, Y_DATOS, 240, 135 - Y_DATOS, TFT_BLACK);
 
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.drawString("SIN WIFI", 8, 26, 2);
+    tft.drawString("SIN WIFI", 8, 35, 2);
 
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString("Conectese a la red :", 8, 44, 2);
+    tft.drawString("Conectese a la red :", 8, 51, 2);
 
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString(apSsid, 8, 62, 4);
+    tft.drawString(apSsid, 8, 67, 4);
 
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString("y abra 192.168.4.1", 8, 92, 2);
+    tft.drawString("y abra 192.168.4.1", 8, 95, 2);
 
     // Se aclara que la energia no se pierde mientras no hay red.
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("pend: " + String(kwhPendiente, 3) + " kWh", 8, 112, 2);
+    tft.drawString("pend: " + String(kwhPendiente, 3) + " kWh", 8, 116, 2);
 }
 
 void ActualizarDisplay()
@@ -208,26 +258,27 @@ void ActualizarDisplay()
         return;
     }
 
-    // El encabezado queda fijo, se repinta solo el area de datos.
-    tft.fillRect(0, 22, 240, 113, TFT_BLACK);
+    DibujarEncabezado(); // la hora avanza en cada actualizacion
+    tft.fillRect(0, Y_DATOS, 240, 135 - Y_DATOS, TFT_BLACK);
 
+    tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
     tft.setTextSize(2);
-    tft.drawString(String(corriente, 2) + " A", 8, 30, 4);
+    tft.drawString(String(potencia, 0) + " W", 120, 62, 4);
     tft.setTextSize(1);
 
+    tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String(potencia, 0) + " W", 8, 88, 4);
+    tft.drawString(String(tension, 0) + " V", 8, 92, 4);
 
-    // La tension puede venir del transformador o ser el nominal asumido: se aclara
-    // debajo del valor para no confundir un dato medido con uno supuesto.
-    tft.setTextColor(tensionMedida ? TFT_WHITE : TFT_DARKGREY, TFT_BLACK);
-    tft.drawString(String(tension, 0) + " V", 140, 88, 4);
-    tft.setTextColor(tensionMedida ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-    tft.drawString(tensionMedida ? "online" : "fijo", 140, 116, 2);
-
+    tft.setTextDatum(TR_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String(kwh, 3) + " kWh", 8, 116, 2);
+    tft.drawString(String(corriente, 2) + " A", 232, 92, 4);
+
+    tft.setTextDatum(BC_DATUM);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString(String(kwh, 3) + " kWh", 120, 135, 2);
+    tft.setTextDatum(TL_DATUM);
 
     // Estado de conexion, arriba a la derecha junto al nombre del equipo.
     bool wifiOk = WiFi.status() == WL_CONNECTED;
@@ -284,6 +335,7 @@ void GuardarNombre(const String &crudo)
 // ------------------------------------------------------------------ hora
 void SincronizarHora()
 {
+    MostrarEstado("Sincronizando", "hora NTP");
     configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
 
     struct tm localTime;
@@ -373,6 +425,7 @@ String PaginaPrincipal()
 bool IntentarConectar(const String &ssid, const String &pass)
 {
     Serial.printf("Probando %s...\n", ssid.c_str());
+    MostrarEstado("Conectando WiFi...", ssid);
     WiFi.begin(ssid.c_str(), pass.c_str());
 
     unsigned long inicio = millis();
@@ -387,6 +440,7 @@ bool IntentarConectar(const String &ssid, const String &pass)
         WiFi.setAutoReconnect(true);
         Serial.print("Conectado. IP: ");
         Serial.println(WiFi.localIP());
+        MostrarEstado("WiFi conectado", WiFi.localIP().toString());
         return true;
     }
     return false;
@@ -400,6 +454,7 @@ bool ConectarAGuardadas()
         return false;
     }
 
+    MostrarEstado("Buscando redes...");
     int encontradas = WiFi.scanNetworks();
     for (int i = 0; i < encontradas; i++)
     {
@@ -451,6 +506,7 @@ void ManejarGuardar()
     {
         DetenerPortal();
         SincronizarHora();
+        ActualizarDisplay();
     }
 }
 
@@ -483,6 +539,7 @@ void IniciarPortal()
     }
 
     apSsid = "medidor-" + deviceName;
+    MostrarEstado("Sin red conocida", "abriendo portal...");
 
     // El escaneo va ANTES de levantar el AP, con la radio libre. Y hay que cortar
     // la parte STA: si sigue reintentando una red guardada en segundo plano, arrastra
@@ -575,16 +632,11 @@ void MedirValores()
 
     // Tension: misma tecnica, escalada por el transformador + divisor.
     MedicionRms red = MedirRms(TENSION_PIN);
-    float tensionLeida = red.rmsVolt * TENSION_ESCALA;
-    tensionMedida = tensionLeida >= TENSION_MINIMA;
-
-    // Mientras no haya transformador conectado se sigue usando el nominal, asi el
-    // equipo mide igual y pasa a la tension real sola cuando la entrada este cableada.
-    tension = tensionMedida ? tensionLeida : TENSION_RED;
+    tension = red.rmsVolt * TENSION_ESCALA;
     potencia = tension * corriente;
 
-    Serial.printf("%.3f A  %.1f V%s  %.0f W\n", corriente, tension,
-                  tensionMedida ? "" : "(fijo)", potencia);
+    Serial.printf("%.3f A  %.1f V  %.0f W  (pin V: %.3f Vrms, offset %.3f V)\n",
+                  corriente, tension, potencia, red.rmsVolt, red.offsetVolt);
 
     // La energia se integra con el tiempo real transcurrido, no con el nominal de
     // 5 s: si el envio se atrasa o el portal bloquea el loop, el kWh sigue siendo
@@ -615,7 +667,6 @@ bool PublicarMedicion()
                      "\",\"ts\":\"" + timestamp + "\"" +
                      ",\"tipo\":\"medicion\",\"data\":{\"corriente\":" +
                      String(corriente) + ",\"tension\":" + String(tension) +
-                     ",\"tension_medida\":" + (tensionMedida ? "true" : "false") +
                      ",\"potencia\":" + String(potencia) +
                      ",\"intervalo_segundos\":" + String(segundosPendientes, 1) +
                      ",\"kwh_intervalo\":" + String(kwhPendiente, 6) + "}}";
@@ -627,6 +678,19 @@ bool PublicarMedicion()
     }
 
     Serial.printf("Enviado: %s\n", mensaje.c_str());
+    return true;
+}
+
+bool ConectarMqtt()
+{
+    ultimoIntentoMqtt = millis();
+
+    String clientId = "esp32-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF), HEX);
+    if (!mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword))
+    {
+        Serial.printf("MQTT fallo (estado %d)\n", mqttClient.state());
+        return false;
+    }
     return true;
 }
 
@@ -642,24 +706,18 @@ void AtenderMqtt()
     {
         return;
     }
-    ultimoIntentoMqtt = millis();
-
-    String clientId = "esp32-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF), HEX);
-    if (!mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword))
-    {
-        Serial.printf("MQTT fallo (estado %d)\n", mqttClient.state());
-    }
+    ConectarMqtt();
 }
 
 // ------------------------------------------------------------------ setup / loop
 void setup()
 {
     Serial.begin(115200);
-    delay(3000);
-    Serial.printf("Motivo del reset: %d\n", esp_reset_reason());
-
     CargarNombre(); // antes del display: el encabezado muestra el nombre
     IniciarDisplay();
+
+    delay(3000); // tiempo para abrir el monitor serie
+    Serial.printf("Motivo del reset: %d\n", esp_reset_reason());
 
     // El canal ADC del pin se adjunta en la primera lectura: hacemos una lectura
     // dummy antes de fijar la atenuacion, si no analogSetPinAttenuation() falla con
@@ -687,6 +745,19 @@ void setup()
     mqttClient.setServer(mqttHost, mqttPort);
     mqttClient.setKeepAlive(60);
     mqttClient.setSocketTimeout(10);
+    // El default de 256 bytes no alcanza para topic + JSON con un nombre largo.
+    mqttClient.setBufferSize(512);
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        MostrarEstado("Conectando MQTT...", mqttHost);
+        ConectarMqtt();
+    }
+
+    MostrarEstado("Midiendo...");
+    MedirValores();
+    lastMessage = millis();
+    ActualizarDisplay();
     Serial.println("Init listo.");
 }
 
@@ -715,6 +786,7 @@ void loop()
             {
                 DetenerPortal();
                 SincronizarHora();
+                ActualizarDisplay();
             }
         }
     }
@@ -727,6 +799,7 @@ void loop()
         else
         {
             SincronizarHora();
+            ActualizarDisplay();
         }
     }
 

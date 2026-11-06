@@ -604,6 +604,7 @@
                 "TFT_CS=5",
                 "TFT_DC=16",
                 "TFT_RST=23",
+                "TOUCH_CS=-1",
                 "SPI_FREQUENCY=40000000",
                 "TFT_BL=4",
                 "TFT_BACKLIGHT_ON=HIGH",
