@@ -30,6 +30,7 @@ Las telemetrias se envian a una base de datos por medio de wifi -> MQTT -> Base 
 - Server https://vercel.com/
 - Una pagina web para mostrar datos de la base de datos.
 - En principio creada en Next.Js
-- https://medidor-energia-2026.vercel.app/
+    https://medidor-energia-2026.vercel.app/
 
 - *Test local*: npm run dev
+    http://localhost:3000/
