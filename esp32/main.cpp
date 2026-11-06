@@ -21,7 +21,7 @@ const char *nombreFabrica = "zapa01";
 const char *wifiSsidFabrica = "micromicro";
 const char *wifiPasswordFabrica = "micromicro";
 
-const unsigned long wifiTimeoutMs = 12000;   // por red; se prueban varias seguidas
+const unsigned long wifiTimeoutMs = 12000; // por red; se prueban varias seguidas
 const unsigned long mqttRetryMs = 5000;
 const unsigned long messageInterval = 5000;
 const unsigned long reintentoWifiMs = 30000; // cada cuanto reintentar desde el portal
@@ -29,19 +29,23 @@ const unsigned long graciaPortalMs = 45000;  // pausa de reintentos tras usar el
 
 // GPIO34 esta ocupado en la T-Display: va al divisor que mide la bateria.
 // La salida del ACS712 (0-5V) pasa por un divisor 10k/20k antes del pin.
-const int ACS712_PIN = 32;               // ADC1_CH4, libre en el header
+const int ACS712_PIN = 32; // ADC1_CH4, libre en el header
 const float ACS712_DIVISOR = 20.0f / (10.0f + 20.0f);
 const float ACS712_SENSITIVITY = 0.185f * ACS712_DIVISOR; // 5A: 185 mV/A en el sensor
+
+// RELE conectado al pin 25 para encender la carga.
+const int RELE_PIN = 25;
 
 // Entrada de tension (ver documentacion/circuito.jpeg): transformador 220/11.5V,
 // divisor 100k/6k8, capacitor de 1uF y polarizacion a 1.65V con 100k/100k.
 // El capacitor en serie con los 50k de polarizacion tambien atenua a 50 Hz.
 // Si la tension mostrada no coincide con un tester, ajustar TRAFO_SECUNDARIO.
-const int TENSION_PIN = 33;              // ADC1_CH5, libre en el header
+const int TENSION_PIN = 33; // ADC1_CH5, libre en el header
 const float TRAFO_PRIMARIO = 220.0f;
-const float TRAFO_SECUNDARIO = 11.5f;
+// Nominal 11.5V; calibrado contra multimetro (220.5V reales, mostraba 237V con 11.5).
+const float TRAFO_SECUNDARIO = 11.5f * 237.0f / 220.5f;
 const float DIV_SERIE = 100000.0f, DIV_INFERIOR = 6800.0f;
-const float POLARIZACION = 50000.0f;               // 100k || 100k
+const float POLARIZACION = 50000.0f; // 100k || 100k
 const float REACTANCIA_C = 1.0f / (2.0f * PI * 50.0f * 1e-6f);
 const float DIV_THEVENIN = DIV_SERIE * DIV_INFERIOR / (DIV_SERIE + DIV_INFERIOR);
 const float TENSION_ESCALA =
@@ -50,7 +54,9 @@ const float TENSION_ESCALA =
     (sqrtf(powf(DIV_THEVENIN + POLARIZACION, 2) + powf(REACTANCIA_C, 2)) / POLARIZACION);
 
 const uint32_t VENTANA_MUESTREO_MS = 200;
-const float CORRIENTE_MINIMA = 0.05f; // piso de ruido del sensor, debajo de esto es cero
+const float CORRIENTE_RUIDO = 0.15f;  // RMS que marca el sensor sin carga (medido)
+const float CORRIENTE_MINIMA = 0.10f; // tras restar el ruido, debajo de esto es cero
+const float TENSION_MINIMA = 20.0f;   // sin red el ADC lee ~1V de ruido: debajo de esto es cero
 
 const uint8_t MAX_REDES = 5;
 
@@ -78,7 +84,7 @@ uint8_t cantidadRedes = 0;
 bool portalActivo = false;
 unsigned long ultimoClienteMs = 0; // ultima vez que hubo alguien asociado al AP
 String apSsid;
-String redesEscaneadas;       // <option> cacheados del ultimo escaneo
+String redesEscaneadas; // <option> cacheados del ultimo escaneo
 
 String deviceName; // editable desde el portal, persiste en flash
 String mqttTopic;  // telemetria/<deviceName>, se rearma al renombrar
@@ -550,7 +556,7 @@ void IniciarPortal()
     delay(100);
     EscanearRedes();
 
-    WiFi.mode(WIFI_AP_STA); // AP_STA: el STA hace falta para reintentar y para /rescan
+    WiFi.mode(WIFI_AP_STA);                  // AP_STA: el STA hace falta para reintentar y para /rescan
     WiFi.softAP(apSsid.c_str(), nullptr, 1); // canal 1 fijo, abierta (sin clave)
 
     server.on("/", ManejarRaiz);
@@ -624,7 +630,11 @@ void MedirValores()
     }
 
     adcOffsetVoltage = sensor.offsetVolt;
-    corriente = sensor.rmsVolt / ACS712_SENSITIVITY;
+    // El ruido no esta correlacionado con la senal: se suma en cuadratura al RMS,
+    // asi que se resta en cuadratura y no linealmente.
+    float corrienteLeida = sensor.rmsVolt / ACS712_SENSITIVITY;
+    float cuadrado = corrienteLeida * corrienteLeida - CORRIENTE_RUIDO * CORRIENTE_RUIDO;
+    corriente = cuadrado > 0.0f ? sqrtf(cuadrado) : 0.0f;
     if (corriente < CORRIENTE_MINIMA)
     {
         corriente = 0.0f;
@@ -633,6 +643,10 @@ void MedirValores()
     // Tension: misma tecnica, escalada por el transformador + divisor.
     MedicionRms red = MedirRms(TENSION_PIN);
     tension = red.rmsVolt * TENSION_ESCALA;
+    if (tension < TENSION_MINIMA)
+    {
+        tension = 0.0f;
+    }
     potencia = tension * corriente;
 
     Serial.printf("%.3f A  %.1f V  %.0f W  (pin V: %.3f Vrms, offset %.3f V)\n",
@@ -715,6 +729,13 @@ void setup()
     Serial.begin(115200);
     CargarNombre(); // antes del display: el encabezado muestra el nombre
     IniciarDisplay();
+
+    // enciendo el RELE por ahora, porque no lo puedo controlar,
+    // falta agregar un comando MQTT para encender/apagar la carga
+    // o bien un boton en el portal para hacerlo,
+    // o un boton fisico en el equipo, que es lo mas simple.
+    pinMode(RELE_PIN, OUTPUT);
+    digitalWrite(RELE_PIN, HIGH); // activo el rele para encender la carga
 
     delay(3000); // tiempo para abrir el monitor serie
     Serial.printf("Motivo del reset: %d\n", esp_reset_reason());

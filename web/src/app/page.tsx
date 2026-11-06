@@ -14,7 +14,7 @@ type Medicion = {
 };
 
 type Respuesta =
-  | { ok: true; ultima: Medicion | null; kwhHoy: number | null; ahora?: string }
+  | { ok: true; ultima: Medicion | null; kwhHora: number; ahora?: string }
   | { ok: false; error: string };
 
 const INTERVALO_MS = 5000;
@@ -172,10 +172,7 @@ export default function Home() {
                   {(medicion.data.corriente ?? 0).toFixed(2)} A
                 </Texto>
                 <Texto x={120} y={135} alto={16} color={COLOR.gris} ancla="bc">
-                  {respuesta?.ok && respuesta.kwhHoy !== null
-                    ? respuesta.kwhHoy.toFixed(3)
-                    : "-.---"}{" "}
-                  kWh hoy
+                  {respuesta?.ok ? respuesta.kwhHora.toFixed(3) : "-.---"} kWh/h
                 </Texto>
               </>
             )
