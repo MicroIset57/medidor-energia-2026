@@ -130,19 +130,19 @@ export default function Home() {
           className="relative w-full overflow-hidden rounded bg-black font-mono"
           style={{ aspectRatio: "240 / 135", containerType: "inline-size" }}
         >
-          <Texto x={5} y={0} alto={16} color={COLOR.blanco}>
+          <Texto x={5} y={2} alto={14} color={COLOR.blanco}>
             {FechaHora(medicion?.ts ?? null)}
           </Texto>
-          <Texto x={5} y={16} alto={16} color={COLOR.grisClaro}>
+          <Texto x={5} y={18} alto={14} color={COLOR.grisClaro}>
             {medicion?.device ?? ""}
           </Texto>
 
           {medicion && (
             <>
-              <Texto x={150} y={3} alto={16} color={online ? COLOR.verde : COLOR.rojo}>
+              <Texto x={150} y={2} alto={14} color={online ? COLOR.verde : COLOR.rojo}>
                 {online ? "WiFi" : "----"}
               </Texto>
-              <Texto x={195} y={3} alto={16} color={online ? COLOR.verde : COLOR.rojo}>
+              <Texto x={195} y={2} alto={14} color={online ? COLOR.verde : COLOR.rojo}>
                 {online ? "MQTT" : "----"}
               </Texto>
             </>
